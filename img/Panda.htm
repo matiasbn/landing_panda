@@ -1,0 +1,2401 @@
+
+<!-- saved from url=(0033)http://127.0.0.1:59368/index.html -->
+<html data-brackets-id="1" lang="en"><head data-brackets-id="2"><meta http-equiv="Content-Type" content="text/html; charset=UTF-8"><script>
+/*
+ * Copyright (c) 2014 - present Adobe Systems Incorporated. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ *
+ */
+
+// This is a transport injected into the browser via a script that handles the low
+// level communication between the live development protocol handlers on both sides.
+// This transport provides a web socket mechanism. It's injected separately from the
+// protocol handler so that the transport can be changed separately.
+
+(function (global) {
+    "use strict";
+
+    var WebSocketTransport = {
+        /**
+         * @private
+         * The WebSocket that we communicate with Brackets over.
+         * @type {?WebSocket}
+         */
+        _ws: null,
+
+        /**
+         * @private
+         * An object that contains callbacks to handle various transport events. See `setCallbacks()`.
+         * @type {?{connect: ?function, message: ?function(string), close: ?function}}
+         */
+        _callbacks: null,
+
+        /**
+         * Sets the callbacks that should be called when various transport events occur. All callbacks
+         * are optional, but you should at least implement "message" or nothing interesting will happen :)
+         * @param {?{connect: ?function, message: ?function(string), close: ?function}} callbacks
+         *      The callbacks to set.
+         *      connect - called when a connection is established to Brackets
+         *      message(msgStr) - called with a string message sent from Brackets
+         *      close - called when Brackets closes the connection
+         */
+        setCallbacks: function (callbacks) {
+            if (!global._Brackets_LiveDev_Socket_Transport_URL) {
+                console.error("[Brackets LiveDev] No socket transport URL injected");
+            } else {
+                this._callbacks = callbacks;
+            }
+        },
+
+        /**
+         * Connects to the NodeSocketTransport in Brackets at the given WebSocket URL.
+         * @param {string} url
+         */
+        connect: function (url) {
+            var self = this;
+            this._ws = new WebSocket(url);
+
+            // One potential source of confusion: the transport sends two "types" of messages -
+            // these are distinct from the protocol's own messages. This is because this transport
+            // needs to send an initial "connect" message telling the Brackets side of the transport
+            // the URL of the page that it's connecting from, distinct from the actual protocol
+            // message traffic. Actual protocol messages are sent as a JSON payload in a message of
+            // type "message".
+            //
+            // Other transports might not need to do this - for example, a transport that simply
+            // talks to an iframe within the same process already knows what URL that iframe is
+            // pointing to, so the only comunication that needs to happen via postMessage() is the
+            // actual protocol message strings, and no extra wrapping is necessary.
+
+            this._ws.onopen = function (event) {
+                // Send the initial "connect" message to tell the other end what URL we're from.
+                self._ws.send(JSON.stringify({
+                    type: "connect",
+                    url: global.location.href
+                }));
+                console.log("[Brackets LiveDev] Connected to Brackets at " + url);
+                if (self._callbacks && self._callbacks.connect) {
+                    self._callbacks.connect();
+                }
+            };
+            this._ws.onmessage = function (event) {
+                console.log("[Brackets LiveDev] Got message: " + event.data);
+                if (self._callbacks && self._callbacks.message) {
+                    self._callbacks.message(event.data);
+                }
+            };
+            this._ws.onclose = function (event) {
+                self._ws = null;
+                if (self._callbacks && self._callbacks.close) {
+                    self._callbacks.close();
+                }
+            };
+            // TODO: onerror
+        },
+
+        /**
+         * Sends a message over the transport.
+         * @param {string} msgStr The message to send.
+         */
+        send: function (msgStr) {
+            if (this._ws) {
+                // See comment in `connect()` above about why we wrap the message in a transport message
+                // object.
+                this._ws.send(JSON.stringify({
+                    type: "message",
+                    message: msgStr
+                }));
+            } else {
+                console.log("[Brackets LiveDev] Tried to send message over closed connection: " + msgStr);
+            }
+        },
+
+        /**
+         * Establish web socket connection.
+         */
+        enable: function () {
+            this.connect(global._Brackets_LiveDev_Socket_Transport_URL);
+        }
+    };
+    global._Brackets_LiveDev_Transport = WebSocketTransport;
+}(this));
+this._Brackets_LiveDev_Socket_Transport_URL = 'ws://localhost:8123';
+</script>
+<script>
+/*
+ * Copyright (c) 2014 - present Adobe Systems Incorporated. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ *
+ */
+
+/*jslint evil: true */
+
+// This is the script that Brackets live development injects into HTML pages in order to
+// establish and maintain the live development socket connection. Note that Brackets may
+// also inject other scripts via "evaluate" once this has connected back to Brackets.
+
+(function (global) {
+    "use strict";
+
+    // This protocol handler assumes that there is also an injected transport script that
+    // has the following methods:
+    //     setCallbacks(obj) - a method that takes an object with a "message" callback that
+    //         will be called with the message string whenever a message is received by the transport.
+    //     send(msgStr) - sends the given message string over the transport.
+    var transport = global._Brackets_LiveDev_Transport;
+
+    /**
+     * Manage messaging between Editor and Browser at the protocol layer.
+     * Handle messages that arrives through the current transport and dispatch them
+     * to subscribers. Subscribers are handlers that implements remote commands/functions.
+     * Property 'method' of messages body is used as the 'key' to identify message types.
+     * Provide a 'send' operation that allows remote commands sending messages to the Editor.
+     */
+    var MessageBroker = {
+
+        /**
+         * Collection of handlers (subscribers) per each method.
+         * To be pushed by 'on' and consumed by 'trigger' stored this way:
+         *      handlers[method] = [handler1, handler2, ...]
+         */
+        handlers: {},
+
+         /**
+          * Dispatch messages to handlers according to msg.method value.
+          * @param {Object} msg Message to be dispatched.
+          */
+        trigger: function (msg) {
+            var msgHandlers;
+            if (!msg.method) {
+                // no message type, ignoring it
+                // TODO: should we trigger a generic event?
+                console.log("[Brackets LiveDev] Received message without method.");
+                return;
+            }
+            // get handlers for msg.method
+            msgHandlers = this.handlers[msg.method];
+
+            if (msgHandlers && msgHandlers.length > 0) {
+                // invoke handlers with the received message
+                msgHandlers.forEach(function (handler) {
+                    try {
+                        // TODO: check which context should be used to call handlers here.
+                        handler(msg);
+                        return;
+                    } catch (e) {
+                        console.log("[Brackets LiveDev] Error executing a handler for " + msg.method);
+                        console.log(e.stack);
+                        return;
+                    }
+                });
+            } else {
+                // no subscribers, ignore it.
+                // TODO: any other default handling? (eg. specific respond, trigger as a generic event, etc.);
+                console.log("[Brackets LiveDev] No subscribers for message " + msg.method);
+                return;
+            }
+        },
+
+        /**
+         * Send a response of a particular message to the Editor.
+         * Original message must provide an 'id' property
+         * @param {Object} orig Original message.
+         * @param {Object} response Message to be sent as the response.
+         */
+        respond: function (orig, response) {
+            if (!orig.id) {
+                console.log("[Brackets LiveDev] Trying to send a response for a message with no ID");
+                return;
+            }
+            response.id = orig.id;
+            this.send(response);
+        },
+
+        /**
+         * Subscribe handlers to specific messages.
+         * @param {string} method Message type.
+         * @param {function} handler.
+         * TODO: add handler name or any identification mechanism to then implement 'off'?
+         */
+        on: function (method, handler) {
+            if (!method || !handler) {
+                return;
+            }
+            if (!this.handlers[method]) {
+                //initialize array
+                this.handlers[method] = [];
+            }
+            // add handler to the stack
+            this.handlers[method].push(handler);
+        },
+
+        /**
+         * Send a message to the Editor.
+         * @param {string} msgStr Message to be sent.
+         */
+        send: function (msgStr) {
+            transport.send(JSON.stringify(msgStr));
+        }
+    };
+
+    /**
+     * Runtime Domain. Implements remote commands for "Runtime.*"
+     */
+    var Runtime = {
+        /**
+         * Evaluate an expresion and return its result.
+         */
+        evaluate: function (msg) {
+            console.log("Runtime.evaluate");
+            var result = eval(msg.params.expression);
+            MessageBroker.respond(msg, {
+                result: JSON.stringify(result) // TODO: in original protocol this is an object handle
+            });
+        }
+    };
+
+    // subscribe handler to method Runtime.evaluate
+    MessageBroker.on("Runtime.evaluate", Runtime.evaluate);
+
+    /**
+     * CSS Domain.
+     */
+    var CSS = {
+
+        setStylesheetText : function (msg) {
+
+            if (!msg || !msg.params || !msg.params.text || !msg.params.url) {
+                return;
+            }
+
+            var i,
+                node;
+
+            var head = window.document.getElementsByTagName('head')[0];
+            // create an style element to replace the one loaded with <link>
+            var s = window.document.createElement('style');
+            s.type = 'text/css';
+            s.appendChild(window.document.createTextNode(msg.params.text));
+
+            for (i = 0; i < window.document.styleSheets.length; i++) {
+                node = window.document.styleSheets[i];
+                if (node.ownerNode.id === msg.params.url) {
+                    head.insertBefore(s, node.ownerNode); // insert the style element here
+                    // now can remove the style element previously created (if any)
+                    node.ownerNode.parentNode.removeChild(node.ownerNode);
+                } else if (node.href === msg.params.url  && !node.disabled) {
+                    // if the link element to change
+                    head.insertBefore(s, node.ownerNode); // insert the style element here
+                    node.disabled = true;
+                    i++; // since we have just inserted a stylesheet
+                }
+            }
+            s.id = msg.params.url;
+        },
+
+        /**
+        * retrieves the content of the stylesheet
+        * TODO: it now depends on reloadCSS implementation
+        */
+        getStylesheetText: function (msg) {
+            var i,
+                sheet,
+                text = "";
+            for (i = 0; i < window.document.styleSheets.length; i++) {
+                sheet = window.document.styleSheets[i];
+                // if it was already 'reloaded'
+                if (sheet.ownerNode.id ===  msg.params.url) {
+                    text = sheet.ownerNode.textContent;
+                } else if (sheet.href === msg.params.url && !sheet.disabled) {
+                    var j,
+                        rules;
+
+                    // Deal with Firefox's SecurityError when accessing sheets
+                    // from other domains, and Chrome returning `undefined`.
+                    try {
+                        rules = window.document.styleSheets[i].cssRules;
+                    } catch (e) {
+                        if (e.name !== "SecurityError") {
+                            throw e;
+                        }
+                    }
+                    if (!rules) {
+                        return;
+                    }
+
+                    for (j = 0; j < rules.length; j++) {
+                        text += rules[j].cssText + '\n';
+                    }
+                }
+            }
+
+            MessageBroker.respond(msg, {
+                text: text
+            });
+        }
+    };
+
+    MessageBroker.on("CSS.setStylesheetText", CSS.setStylesheetText);
+    MessageBroker.on("CSS.getStylesheetText", CSS.getStylesheetText);
+
+    /**
+     * Page Domain.
+     */
+    var Page = {
+        /**
+         * Reload the current page optionally ignoring cache.
+         * @param {Object} msg
+         */
+        reload: function (msg) {
+            // just reload the page
+            window.location.reload(msg.params.ignoreCache);
+        },
+
+        /**
+         * Navigate to a different page.
+         * @param {Object} msg
+         */
+        navigate: function (msg) {
+            if (msg.params.url) {
+                // navigate to a new page.
+                window.location.replace(msg.params.url);
+            }
+        }
+    };
+
+    // subscribe handler to method Page.reload
+    MessageBroker.on("Page.reload", Page.reload);
+    MessageBroker.on("Page.navigate", Page.navigate);
+    MessageBroker.on("ConnectionClose", Page.close);
+
+
+
+    // By the time this executes, there must already be an active transport.
+    if (!transport) {
+        console.error("[Brackets LiveDev] No transport set");
+        return;
+    }
+
+    var ProtocolManager = {
+
+        _documentObserver: {},
+
+        _protocolHandler: {},
+
+        enable: function () {
+            transport.setCallbacks(this._protocolHandler);
+            transport.enable();
+        },
+
+        onConnect: function () {
+            this._documentObserver.start(window.document, transport);
+        },
+
+        onClose: function () {
+            var body = window.document.getElementsByTagName("body")[0],
+                overlay = window.document.createElement("div"),
+                background = window.document.createElement("div"),
+                status = window.document.createElement("div");
+
+            overlay.style.width = "100%";
+            overlay.style.height = "100%";
+            overlay.style.zIndex = 2227;
+            overlay.style.position = "absolute";
+            overlay.style.top = 0;
+            overlay.style.left = 0;
+
+            background.style.backgroundColor = "#fff";
+            background.style.opacity = 0.5;
+            background.style.width = "100%";
+            background.style.height = "100%";
+            background.style.position = "absolute";
+            background.style.top = 0;
+            background.style.left = 0;
+
+            status.textContent = "Live Development Session has Ended";
+            status.style.width = "100%";
+            status.style.color = "#fff";
+            status.style.backgroundColor = "#666";
+            status.style.position = "absolute";
+            status.style.top = 0;
+            status.style.left = 0;
+            status.style.padding = "0.2em";
+            status.style.verticalAlign = "top";
+            status.style.textAlign = "center";
+            overlay.appendChild(background);
+            overlay.appendChild(status);
+            body.appendChild(overlay);
+
+            // change the title as well
+            window.document.title = "(Brackets Live Preview: closed) " + window.document.title;
+        },
+
+        setDocumentObserver: function (documentOberver) {
+            if (!documentOberver) {
+                return;
+            }
+            this._documentObserver = documentOberver;
+        },
+
+        setProtocolHandler: function (protocolHandler) {
+            if (!protocolHandler) {
+                return;
+            }
+            this._protocolHandler = protocolHandler;
+        }
+    };
+
+    // exposing ProtocolManager
+    global._Brackets_LiveDev_ProtocolManager = ProtocolManager;
+
+    /**
+     * The remote handler for the protocol.
+     */
+    var ProtocolHandler = {
+        /**
+         * Handles a message from the transport. Parses it as JSON and delegates
+         * to MessageBroker who is in charge of routing them to handlers.
+         * @param {string} msgStr The protocol message as stringified JSON.
+         */
+        message: function (msgStr) {
+            var msg;
+            try {
+                msg = JSON.parse(msgStr);
+            } catch (e) {
+                console.log("[Brackets LiveDev] Malformed message received: ", msgStr);
+                return;
+            }
+            // delegates handling/routing to MessageBroker.
+            MessageBroker.trigger(msg);
+        },
+
+        close: function (evt) {
+            ProtocolManager.onClose();
+        },
+
+        connect: function (evt) {
+            ProtocolManager.onConnect();
+        }
+    };
+
+    ProtocolManager.setProtocolHandler(ProtocolHandler);
+
+    window.addEventListener('load', function () {
+        ProtocolManager.enable();
+    });
+
+}(this));
+</script>
+<script>
+/*
+ * Copyright (c) 2014 - present Adobe Systems Incorporated. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ *
+ */
+
+/*global setInterval, clearInterval */
+
+(function (global) {
+    "use strict";
+
+    var ProtocolManager = global._Brackets_LiveDev_ProtocolManager;
+
+    var _document = null;
+    var _transport;
+
+
+    /**
+     * Retrieves related documents (external CSS and JS files)
+     *
+     * @return {{scripts: object, stylesheets: object}} Related scripts and stylesheets
+     */
+    function related() {
+
+        var rel = {
+            scripts: {},
+            stylesheets: {}
+        };
+        var i;
+        // iterate on document scripts (HTMLCollection doesn't provide forEach iterator).
+        for (i = 0; i < _document.scripts.length; i++) {
+            // add only external scripts
+            if (_document.scripts[i].src) {
+                rel.scripts[_document.scripts[i].src] = true;
+            }
+        }
+
+        var s, j;
+        //traverse @import rules
+        var traverseRules = function _traverseRules(sheet, base) {
+            var i,
+                href = sheet.href,
+                cssRules;
+
+            // Deal with Firefox's SecurityError when accessing sheets
+            // from other domains. Chrome will safely return `undefined`.
+            try {
+                cssRules = sheet.cssRules;
+            } catch (e) {
+                if (e.name !== "SecurityError") {
+                    throw e;
+                }
+            }
+
+            if (href && cssRules) {
+                if (rel.stylesheets[href] === undefined) {
+                    rel.stylesheets[href] = [];
+                }
+                rel.stylesheets[href].push(base);
+
+                for (i = 0; i < cssRules.length; i++) {
+                    if (cssRules[i].href) {
+                        traverseRules(cssRules[i].styleSheet, base);
+                    }
+                }
+            }
+        };
+        //iterate on document.stylesheets (StyleSheetList doesn't provide forEach iterator).
+        for (j = 0; j < window.document.styleSheets.length; j++) {
+            s = window.document.styleSheets[j];
+            traverseRules(s, s.href);
+        }
+        return rel;
+    }
+
+    /**
+     * Common functions.
+     */
+    var Utils = {
+
+        isExternalStylesheet: function (node) {
+            return (node.nodeName.toUpperCase() === "LINK" && node.rel === "stylesheet" && node.href);
+        },
+        isExternalScript: function (node) {
+            return (node.nodeName.toUpperCase() === "SCRIPT" && node.src);
+        }
+    };
+
+    /**
+     * CSS related commands and notifications
+     */
+    var CSS = {
+
+            /**
+            * Maintains a map of stylesheets loaded thorugh @import rules and their parents.
+            * Populated by extractImports, consumed by notifyImportsAdded / notifyImportsRemoved.
+            * @type {
+            */
+            stylesheets : {},
+
+            /**
+             * Check the stylesheet that was just added be really loaded
+             * to be able to extract potential import-ed stylesheets.
+             * It invokes notifyStylesheetAdded once the sheet is loaded.
+             * @param  {string} href Absolute URL of the stylesheet.
+             */
+            checkForStylesheetLoaded : function (href) {
+                var self = this;
+
+
+                // Inspect CSSRules for @imports:
+                // styleSheet obejct is required to scan CSSImportRules but
+                // browsers differ on the implementation of MutationObserver interface.
+                // Webkit triggers notifications before stylesheets are loaded,
+                // Firefox does it after loading.
+                // There are also differences on when 'load' event is triggered for
+                // the 'link' nodes. Webkit triggers it before stylesheet is loaded.
+                // Some references to check:
+                //      http://www.phpied.com/when-is-a-stylesheet-really-loaded/
+                //      http://stackoverflow.com/questions/17747616/webkit-dynamically-created-stylesheet-when-does-it-really-load
+                //        http://stackoverflow.com/questions/11425209/are-dom-mutation-observers-slower-than-dom-mutation-events
+                //
+                // TODO: This is just a temporary 'cross-browser' solution, it needs optimization.
+                var loadInterval = setInterval(function () {
+                    var i;
+                    for (i = 0; i < window.document.styleSheets.length; i++) {
+                        if (window.document.styleSheets[i].href === href) {
+                            //clear interval
+                            clearInterval(loadInterval);
+                            // notify stylesheets added
+                            self.notifyStylesheetAdded(href);
+                            break;
+                        }
+                    }
+                }, 50);
+            },
+
+            onStylesheetRemoved : function (url) {
+                // get style node created when setting new text for stylesheet.
+                var s = window.document.getElementById(url);
+                // remove
+                if (s && s.parentNode && s.parentNode.removeChild) {
+                    s.parentNode.removeChild(s);
+                }
+            },
+
+            /**
+             * Send a notification for the stylesheet added and
+             * its import-ed styleshets based on document.stylesheets diff
+             * from previous status. It also updates stylesheets status.
+             */
+            notifyStylesheetAdded : function () {
+                var added = {},
+                    current,
+                    newStatus;
+
+                current = this.stylesheets;
+                newStatus = related().stylesheets;
+
+                Object.keys(newStatus).forEach(function (v, i) {
+                    if (!current[v]) {
+                        added[v] = newStatus[v];
+                    }
+                });
+
+                Object.keys(added).forEach(function (v, i) {
+                    _transport.send(JSON.stringify({
+                        method: "StylesheetAdded",
+                        href: v,
+                        roots: [added[v]]
+                    }));
+                });
+
+                this.stylesheets = newStatus;
+            },
+
+            /**
+             * Send a notification for the removed stylesheet and
+             * its import-ed styleshets based on document.stylesheets diff
+             * from previous status. It also updates stylesheets status.
+             */
+            notifyStylesheetRemoved : function () {
+
+                var self = this;
+                var removed = {},
+                    newStatus,
+                    current;
+
+                current = self.stylesheets;
+                newStatus = related().stylesheets;
+
+                Object.keys(current).forEach(function (v, i) {
+                    if (!newStatus[v]) {
+                        removed[v] = current[v];
+                        // remove node created by setStylesheetText if any
+                        self.onStylesheetRemoved(current[v]);
+                    }
+                });
+
+                Object.keys(removed).forEach(function (v, i) {
+                    _transport.send(JSON.stringify({
+                        method: "StylesheetRemoved",
+                        href: v,
+                        roots: [removed[v]]
+                    }));
+                });
+
+                self.stylesheets = newStatus;
+            }
+        };
+
+
+    /* process related docs added */
+    function _onNodesAdded(nodes) {
+        var i;
+        for (i = 0; i < nodes.length; i++) {
+            //check for Javascript files
+            if (Utils.isExternalScript(nodes[i])) {
+                _transport.send(JSON.stringify({
+                    method: 'ScriptAdded',
+                    src: nodes[i].src
+                }));
+            }
+            //check for stylesheets
+            if (Utils.isExternalStylesheet(nodes[i])) {
+                CSS.checkForStylesheetLoaded(nodes[i].href);
+            }
+        }
+    }
+    /* process related docs removed */
+    function _onNodesRemoved(nodes) {
+        var i;
+        //iterate on removed nodes
+        for (i = 0; i < nodes.length; i++) {
+
+            // check for external JS files
+            if (Utils.isExternalScript(nodes[i])) {
+                _transport.send(JSON.stringify({
+                    method: 'ScriptRemoved',
+                    src: nodes[i].src
+                }));
+            }
+            //check for external StyleSheets
+            if (Utils.isExternalStylesheet(nodes[i])) {
+                CSS.notifyStylesheetRemoved(nodes[i].href);
+            }
+        }
+    }
+
+    function _enableListeners() {
+        // enable MutationOberver if it's supported
+        var MutationObserver = window.MutationObserver || window.WebKitMutationObserver || window.MozMutationObserver;
+        if (MutationObserver) {
+            var observer = new MutationObserver(function (mutations) {
+                mutations.forEach(function (mutation) {
+                    if (mutation.addedNodes.length > 0) {
+                        _onNodesAdded(mutation.addedNodes);
+                    }
+                    if (mutation.removedNodes.length > 0) {
+                        _onNodesRemoved(mutation.removedNodes);
+                    }
+                });
+            });
+            observer.observe(_document, {
+                childList: true,
+                subtree: true
+            });
+        } else {
+            // use MutationEvents as fallback
+            window.document.addEventListener('DOMNodeInserted', function niLstnr(e) {
+                _onNodesAdded([e.target]);
+            });
+            window.document.addEventListener('DOMNodeRemoved', function nrLstnr(e) {
+                _onNodesRemoved([e.target]);
+            });
+        }
+    }
+
+
+    /**
+     * Start listening for events and send initial related documents message.
+     *
+     * @param {HTMLDocument} document
+     * @param {object} transport Live development transport connection
+     */
+    function start(document, transport) {
+        _transport = transport;
+        _document = document;
+        // start listening to node changes
+        _enableListeners();
+
+        var rel = related();
+
+        // send the current status of related docs.
+        _transport.send(JSON.stringify({
+            method: "DocumentRelated",
+            related: rel
+        }));
+        // initialize stylesheets with current status for further notifications.
+        CSS.stylesheets = rel.stylesheets;
+    }
+
+    /**
+     * Stop listening.
+     * TODO currently a no-op.
+     */
+    function stop() {
+
+    }
+
+    var DocumentObserver = {
+        start: start,
+        stop: stop,
+        related: related
+    };
+
+    ProtocolManager.setDocumentObserver(DocumentObserver);
+
+}(this));
+window._LD=(/*
+ * Copyright (c) 2012 - present Adobe Systems Incorporated. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a
+ * copy of this software and associated documentation files (the "Software"),
+ * to deal in the Software without restriction, including without limitation
+ * the rights to use, copy, modify, merge, publish, distribute, sublicense,
+ * and/or sell copies of the Software, and to permit persons to whom the
+ * Software is furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+ *
+ */
+
+/*jslint forin: true */
+/*global Node */
+/*theseus instrument: false */
+
+/**
+ * RemoteFunctions define the functions to be executed in the browser. This
+ * modules should define a single function that returns an object of all
+ * exported functions.
+ */
+function RemoteFunctions(experimental) {
+    "use strict";
+
+    var lastKeepAliveTime = Date.now();
+
+    /**
+     * @type {DOMEditHandler}
+     */
+    var _editHandler;
+
+    var HIGHLIGHT_CLASSNAME = "__brackets-ld-highlight",
+        KEEP_ALIVE_TIMEOUT  = 3000;   // Keep alive timeout value, in milliseconds
+
+    // determine whether an event should be processed for Live Development
+    function _validEvent(event) {
+        if (window.navigator.platform.substr(0, 3) === "Mac") {
+            // Mac
+            return event.metaKey;
+        } else {
+            // Windows
+            return event.ctrlKey;
+        }
+    }
+
+    // determine the color for a type
+    function _typeColor(type, highlight) {
+        switch (type) {
+        case "html":
+            return highlight ? "#eec" : "#ffe";
+        case "css":
+            return highlight ? "#cee" : "#eff";
+        case "js":
+            return highlight ? "#ccf" : "#eef";
+        default:
+            return highlight ? "#ddd" : "#eee";
+        }
+    }
+
+    // compute the screen offset of an element
+    function _screenOffset(element) {
+        var elemBounds = element.getBoundingClientRect(),
+            body = window.document.body,
+            offsetTop,
+            offsetLeft;
+
+        if (window.getComputedStyle(body).position === "static") {
+            offsetLeft = elemBounds.left + window.pageXOffset;
+            offsetTop = elemBounds.top + window.pageYOffset;
+        } else {
+            var bodyBounds = body.getBoundingClientRect();
+            offsetLeft = elemBounds.left - bodyBounds.left;
+            offsetTop = elemBounds.top - bodyBounds.top;
+        }
+        return { left: offsetLeft, top: offsetTop };
+    }
+
+    // set an event on a element
+    function _trigger(element, name, value, autoRemove) {
+        var key = "data-ld-" + name;
+        if (value !== undefined && value !== null) {
+            element.setAttribute(key, value);
+            if (autoRemove) {
+                window.setTimeout(element.removeAttribute.bind(element, key));
+            }
+        } else {
+            element.removeAttribute(key);
+        }
+    }
+
+    // construct the info menu
+    function Menu(element) {
+        this.element = element;
+        _trigger(this.element, "showgoto", 1, true);
+        window.setTimeout(window.remoteShowGoto);
+        this.remove = this.remove.bind(this);
+    }
+
+    Menu.prototype = {
+        onClick: function (url, event) {
+            event.preventDefault();
+            _trigger(this.element, "goto", url, true);
+            this.remove();
+        },
+
+        createBody: function () {
+            if (this.body) {
+                return;
+            }
+
+            // compute the position on screen
+            var offset = _screenOffset(this.element),
+                x = offset.left,
+                y = offset.top + this.element.offsetHeight;
+
+            // create the container
+            this.body = window.document.createElement("div");
+            this.body.style.setProperty("z-index", 2147483647);
+            this.body.style.setProperty("position", "absolute");
+            this.body.style.setProperty("left", x + "px");
+            this.body.style.setProperty("top", y + "px");
+            this.body.style.setProperty("font-size", "11pt");
+
+            // draw the background
+            this.body.style.setProperty("background", "#fff");
+            this.body.style.setProperty("border", "1px solid #888");
+            this.body.style.setProperty("-webkit-box-shadow", "2px 2px 6px 0px #ccc");
+            this.body.style.setProperty("border-radius", "6px");
+            this.body.style.setProperty("padding", "6px");
+        },
+
+        addItem: function (target) {
+            var item = window.document.createElement("div");
+            item.style.setProperty("padding", "2px 6px");
+            if (this.body.childNodes.length > 0) {
+                item.style.setProperty("border-top", "1px solid #ccc");
+            }
+            item.style.setProperty("cursor", "pointer");
+            item.style.setProperty("background", _typeColor(target.type));
+            item.innerHTML = target.name;
+            item.addEventListener("click", this.onClick.bind(this, target.url));
+
+            if (target.file) {
+                var file = window.document.createElement("i");
+                file.style.setProperty("float", "right");
+                file.style.setProperty("margin-left", "12px");
+                file.innerHTML = " " + target.file;
+                item.appendChild(file);
+            }
+            this.body.appendChild(item);
+        },
+
+        show: function () {
+            if (!this.body) {
+                this.body = this.createBody();
+            }
+            if (!this.body.parentNode) {
+                window.document.body.appendChild(this.body);
+            }
+            window.document.addEventListener("click", this.remove);
+        },
+
+        remove: function () {
+            if (this.body && this.body.parentNode) {
+                window.document.body.removeChild(this.body);
+            }
+            window.document.removeEventListener("click", this.remove);
+        }
+
+    };
+
+    function Editor(element) {
+        this.onBlur = this.onBlur.bind(this);
+        this.onKeyPress = this.onKeyPress.bind(this);
+
+        this.element = element;
+        this.element.setAttribute("contenteditable", "true");
+        this.element.focus();
+        this.element.addEventListener("blur", this.onBlur);
+        this.element.addEventListener("keypress", this.onKeyPress);
+
+        this.revertText = this.element.innerHTML;
+
+        _trigger(this.element, "edit", 1);
+    }
+
+    Editor.prototype = {
+        onBlur: function (event) {
+            this.element.removeAttribute("contenteditable");
+            this.element.removeEventListener("blur", this.onBlur);
+            this.element.removeEventListener("keypress", this.onKeyPress);
+            _trigger(this.element, "edit", 0, true);
+        },
+
+        onKeyPress: function (event) {
+            switch (event.which) {
+            case 13: // return
+                this.element.blur();
+                break;
+            case 27: // esc
+                this.element.innerHTML = this.revertText;
+                this.element.blur();
+                break;
+            }
+        }
+    };
+
+    function Highlight(color, trigger) {
+        this.color = color;
+        this.trigger = !!trigger;
+        this.elements = [];
+        this.selector = "";
+    }
+
+    Highlight.prototype = {
+        _elementExists: function (element) {
+            var i;
+            for (i in this.elements) {
+                if (this.elements[i] === element) {
+                    return true;
+                }
+            }
+            return false;
+        },
+
+        _makeHighlightDiv: function (element, doAnimation) {
+            var elementBounds = element.getBoundingClientRect(),
+                highlight = window.document.createElement("div"),
+                styles = window.getComputedStyle(element);
+
+            // Don't highlight elements with 0 width & height
+            if (elementBounds.width === 0 && elementBounds.height === 0) {
+                return;
+            }
+
+            highlight.className = HIGHLIGHT_CLASSNAME;
+
+            var offset = _screenOffset(element);
+
+            var stylesToSet = {
+                "left": offset.left + "px",
+                "top": offset.top + "px",
+                "width": elementBounds.width + "px",
+                "height": elementBounds.height + "px",
+                "z-index": 2000000,
+                "margin": 0,
+                "padding": 0,
+                "position": "absolute",
+                "pointer-events": "none",
+                "border-top-left-radius": styles.borderTopLeftRadius,
+                "border-top-right-radius": styles.borderTopRightRadius,
+                "border-bottom-left-radius": styles.borderBottomLeftRadius,
+                "border-bottom-right-radius": styles.borderBottomRightRadius,
+                "border-style": "solid",
+                "border-width": "1px",
+                "border-color": "#00a2ff",
+                "box-shadow": "0 0 1px #fff",
+                "box-sizing": "border-box"
+            };
+
+            var animateStartValues = {
+                "background-color": "rgba(0, 162, 255, 0.5)",
+                "opacity": 0
+            };
+
+            var animateEndValues = {
+                "background-color": "rgba(0, 162, 255, 0)",
+                "opacity": 1
+            };
+
+            var transitionValues = {
+                "-webkit-transition-property": "opacity, background-color",
+                "-webkit-transition-duration": "300ms, 2.3s",
+                "transition-property": "opacity, background-color",
+                "transition-duration": "300ms, 2.3s"
+            };
+
+            function _setStyleValues(styleValues, obj) {
+                var prop;
+
+                for (prop in styleValues) {
+                    obj.setProperty(prop, styleValues[prop]);
+                }
+            }
+
+            _setStyleValues(stylesToSet, highlight.style);
+            _setStyleValues(
+                doAnimation ? animateStartValues : animateEndValues,
+                highlight.style
+            );
+
+
+            if (doAnimation) {
+                _setStyleValues(transitionValues, highlight.style);
+
+                window.setTimeout(function () {
+                    _setStyleValues(animateEndValues, highlight.style);
+                }, 20);
+            }
+
+            window.document.body.appendChild(highlight);
+        },
+
+        add: function (element, doAnimation) {
+            if (this._elementExists(element) || element === window.document) {
+                return;
+            }
+            if (this.trigger) {
+                _trigger(element, "highlight", 1);
+            }
+            this.elements.push(element);
+
+            this._makeHighlightDiv(element, doAnimation);
+        },
+
+        clear: function () {
+            var i, highlights = window.document.querySelectorAll("." + HIGHLIGHT_CLASSNAME),
+                body = window.document.body;
+
+            for (i = 0; i < highlights.length; i++) {
+                body.removeChild(highlights[i]);
+            }
+
+            if (this.trigger) {
+                for (i = 0; i < this.elements.length; i++) {
+                    _trigger(this.elements[i], "highlight", 0);
+                }
+            }
+
+            this.elements = [];
+        },
+
+        redraw: function () {
+            var i, highlighted;
+
+            // When redrawing a selector-based highlight, run a new selector
+            // query to ensure we have the latest set of elements to highlight.
+            if (this.selector) {
+                highlighted = window.document.querySelectorAll(this.selector);
+            } else {
+                highlighted = this.elements.slice(0);
+            }
+
+            this.clear();
+            for (i = 0; i < highlighted.length; i++) {
+                this.add(highlighted[i], false);
+            }
+        }
+    };
+
+    var _currentEditor;
+    function _toggleEditor(element) {
+        _currentEditor = new Editor(element);
+    }
+
+    var _currentMenu;
+    function _toggleMenu(element) {
+        if (_currentMenu) {
+            _currentMenu.remove();
+        }
+        _currentMenu = new Menu(element);
+    }
+
+    var _localHighlight;
+    var _remoteHighlight;
+    var _setup = false;
+
+
+    /** Event Handlers ***********************************************************/
+
+    function onMouseOver(event) {
+        if (_validEvent(event)) {
+            _localHighlight.add(event.target, true);
+        }
+    }
+
+    function onMouseOut(event) {
+        if (_validEvent(event)) {
+            _localHighlight.clear();
+        }
+    }
+
+    function onMouseMove(event) {
+        onMouseOver(event);
+        window.document.removeEventListener("mousemove", onMouseMove);
+    }
+
+    function onClick(event) {
+        if (_validEvent(event)) {
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.altKey) {
+                _toggleEditor(event.target);
+            } else {
+                _toggleMenu(event.target);
+            }
+        }
+    }
+
+    function onKeyUp(event) {
+        if (_setup && !_validEvent(event)) {
+            window.document.removeEventListener("keyup", onKeyUp);
+            window.document.removeEventListener("mouseover", onMouseOver);
+            window.document.removeEventListener("mouseout", onMouseOut);
+            window.document.removeEventListener("mousemove", onMouseMove);
+            window.document.removeEventListener("click", onClick);
+            _localHighlight.clear();
+            _localHighlight = undefined;
+            _setup = false;
+        }
+    }
+
+    function onKeyDown(event) {
+        if (!_setup && _validEvent(event)) {
+            window.document.addEventListener("keyup", onKeyUp);
+            window.document.addEventListener("mouseover", onMouseOver);
+            window.document.addEventListener("mouseout", onMouseOut);
+            window.document.addEventListener("mousemove", onMouseMove);
+            window.document.addEventListener("click", onClick);
+            _localHighlight = new Highlight("#ecc", true);
+            _setup = true;
+        }
+    }
+
+    /** Public Commands **********************************************************/
+
+    // keep alive. Called once a second when a Live Development connection is active.
+    // If several seconds have passed without this method being called, we can assume
+    // that the connection has been severed and we should remove all our code/hooks.
+    function keepAlive() {
+        lastKeepAliveTime = Date.now();
+    }
+
+    // show goto
+    function showGoto(targets) {
+        if (!_currentMenu) {
+            return;
+        }
+        _currentMenu.createBody();
+        var i;
+        for (i in targets) {
+            _currentMenu.addItem(targets[i]);
+        }
+        _currentMenu.show();
+    }
+
+    // remove active highlights
+    function hideHighlight() {
+        if (_remoteHighlight) {
+            _remoteHighlight.clear();
+            _remoteHighlight = null;
+        }
+    }
+
+    // highlight a node
+    function highlight(node, clear) {
+        if (!_remoteHighlight) {
+            _remoteHighlight = new Highlight("#cfc");
+        }
+        if (clear) {
+            _remoteHighlight.clear();
+        }
+        _remoteHighlight.add(node, true);
+    }
+
+    // highlight a rule
+    function highlightRule(rule) {
+        hideHighlight();
+        var i, nodes = window.document.querySelectorAll(rule);
+        for (i = 0; i < nodes.length; i++) {
+            highlight(nodes[i]);
+        }
+        _remoteHighlight.selector = rule;
+    }
+
+    // redraw active highlights
+    function redrawHighlights() {
+        if (_remoteHighlight) {
+            _remoteHighlight.redraw();
+        }
+    }
+
+    window.addEventListener("resize", redrawHighlights);
+    // Add a capture-phase scroll listener to update highlights when
+    // any element scrolls.
+
+    function _scrollHandler(e) {
+        // Document scrolls can be updated immediately. Any other scrolls
+        // need to be updated on a timer to ensure the layout is correct.
+        if (e.target === window.document) {
+            redrawHighlights();
+        } else {
+            if (_remoteHighlight || _localHighlight) {
+                window.setTimeout(redrawHighlights, 0);
+            }
+        }
+    }
+
+    window.addEventListener("scroll", _scrollHandler, true);
+
+    var aliveTest = window.setInterval(function () {
+        if (Date.now() > lastKeepAliveTime + KEEP_ALIVE_TIMEOUT) {
+            // Remove highlights
+            hideHighlight();
+
+            // Remove listeners
+            window.removeEventListener("resize", redrawHighlights);
+            window.removeEventListener("scroll", _scrollHandler, true);
+
+            // Clear this interval
+            window.clearInterval(aliveTest);
+        }
+    }, 1000);
+
+    /**
+     * Constructor
+     * @param {Document} htmlDocument
+     */
+    function DOMEditHandler(htmlDocument) {
+        this.htmlDocument = htmlDocument;
+        this.rememberedNodes = null;
+        this.entityParseParent = htmlDocument.createElement("div");
+    }
+
+    /**
+     * @private
+     * Find the first matching element with the specified data-brackets-id
+     * @param {string} id
+     * @return {Element}
+     */
+    DOMEditHandler.prototype._queryBracketsID = function (id) {
+        if (!id) {
+            return null;
+        }
+
+        if (this.rememberedNodes && this.rememberedNodes[id]) {
+            return this.rememberedNodes[id];
+        }
+
+        var results = this.htmlDocument.querySelectorAll("[data-brackets-id='" + id + "']");
+        return results && results[0];
+    };
+
+    /**
+     * @private
+     * Insert a new child element
+     * @param {Element} targetElement Parent element already in the document
+     * @param {Element} childElement New child element
+     * @param {Object} edit
+     */
+    DOMEditHandler.prototype._insertChildNode = function (targetElement, childElement, edit) {
+        var before = this._queryBracketsID(edit.beforeID),
+            after  = this._queryBracketsID(edit.afterID);
+
+        if (edit.firstChild) {
+            before = targetElement.firstChild;
+        } else if (edit.lastChild) {
+            after = targetElement.lastChild;
+        }
+
+        if (before) {
+            targetElement.insertBefore(childElement, before);
+        } else if (after && (after !== targetElement.lastChild)) {
+            targetElement.insertBefore(childElement, after.nextSibling);
+        } else {
+            targetElement.appendChild(childElement);
+        }
+    };
+
+    /**
+     * @private
+     * Given a string containing encoded entity references, returns the string with the entities decoded.
+     * @param {string} text The text to parse.
+     * @return {string} The decoded text.
+     */
+    DOMEditHandler.prototype._parseEntities = function (text) {
+        // Kind of a hack: just set the innerHTML of a div to the text, which will parse the entities, then
+        // read the content out.
+        var result;
+        this.entityParseParent.innerHTML = text;
+        result = this.entityParseParent.textContent;
+        this.entityParseParent.textContent = "";
+        return result;
+    };
+
+    /**
+     * @private
+     * @param {Node} node
+     * @return {boolean} true if node expects its content to be raw text (not parsed for entities) according to the HTML5 spec.
+     */
+    function _isRawTextNode(node) {
+        return (node.nodeType === Node.ELEMENT_NODE && /script|style|noscript|noframes|noembed|iframe|xmp/i.test(node.tagName));
+    }
+
+    /**
+     * @private
+     * Replace a range of text and comment nodes with an optional new text node
+     * @param {Element} targetElement
+     * @param {Object} edit
+     */
+    DOMEditHandler.prototype._textReplace = function (targetElement, edit) {
+        function prevIgnoringHighlights(node) {
+            do {
+                node = node.previousSibling;
+            } while (node && node.className === HIGHLIGHT_CLASSNAME);
+            return node;
+        }
+        function nextIgnoringHighlights(node) {
+            do {
+                node = node.nextSibling;
+            } while (node && node.className === HIGHLIGHT_CLASSNAME);
+            return node;
+        }
+        function lastChildIgnoringHighlights(node) {
+            node = (node.childNodes.length ? node.childNodes.item(node.childNodes.length - 1) : null);
+            if (node && node.className === HIGHLIGHT_CLASSNAME) {
+                node = prevIgnoringHighlights(node);
+            }
+            return node;
+        }
+
+        var start           = (edit.afterID)  ? this._queryBracketsID(edit.afterID)  : null,
+            startMissing    = edit.afterID && !start,
+            end             = (edit.beforeID) ? this._queryBracketsID(edit.beforeID) : null,
+            endMissing      = edit.beforeID && !end,
+            moveNext        = start && nextIgnoringHighlights(start),
+            current         = moveNext || (end && prevIgnoringHighlights(end)) || lastChildIgnoringHighlights(targetElement),
+            next,
+            textNode        = (edit.content !== undefined) ? this.htmlDocument.createTextNode(_isRawTextNode(targetElement) ? edit.content : this._parseEntities(edit.content)) : null,
+            lastRemovedWasText,
+            isText;
+
+        // remove all nodes inside the range
+        while (current && (current !== end)) {
+            isText = current.nodeType === Node.TEXT_NODE;
+
+            // if start is defined, delete following text nodes
+            // if start is not defined, delete preceding text nodes
+            next = (moveNext) ? nextIgnoringHighlights(current) : prevIgnoringHighlights(current);
+
+            // only delete up to the nearest element.
+            // if the start/end tag was deleted in a prior edit, stop removing
+            // nodes when we hit adjacent text nodes
+            if ((current.nodeType === Node.ELEMENT_NODE) ||
+                    ((startMissing || endMissing) && (isText && lastRemovedWasText))) {
+                break;
+            } else {
+                lastRemovedWasText = isText;
+
+                if (current.remove) {
+                    current.remove();
+                } else if (current.parentNode && current.parentNode.removeChild) {
+                    current.parentNode.removeChild(current);
+                }
+                current = next;
+            }
+        }
+
+        if (textNode) {
+            // OK to use nextSibling here (not nextIgnoringHighlights) because we do literally
+            // want to insert immediately after the start tag.
+            if (start && start.nextSibling) {
+                targetElement.insertBefore(textNode, start.nextSibling);
+            } else if (end) {
+                targetElement.insertBefore(textNode, end);
+            } else {
+                targetElement.appendChild(textNode);
+            }
+        }
+    };
+
+    /**
+     * @private
+     * Apply an array of DOM edits to the document
+     * @param {Array.<Object>} edits
+     */
+    DOMEditHandler.prototype.apply = function (edits) {
+        var targetID,
+            targetElement,
+            childElement,
+            self = this;
+
+        this.rememberedNodes = {};
+
+        edits.forEach(function (edit) {
+            var editIsSpecialTag = edit.type === "elementInsert" && (edit.tag === "html" || edit.tag === "head" || edit.tag === "body");
+
+            if (edit.type === "rememberNodes") {
+                edit.tagIDs.forEach(function (tagID) {
+                    var node = self._queryBracketsID(tagID);
+                    self.rememberedNodes[tagID] = node;
+                    if (node.remove) {
+                        node.remove();
+                    } else if (node.parentNode && node.parentNode.removeChild) {
+                        node.parentNode.removeChild(node);
+                    }
+                });
+                return;
+            }
+
+            targetID = edit.type.match(/textReplace|textDelete|textInsert|elementInsert|elementMove/) ? edit.parentID : edit.tagID;
+            targetElement = self._queryBracketsID(targetID);
+
+            if (!targetElement && !editIsSpecialTag) {
+                console.error("data-brackets-id=" + targetID + " not found");
+                return;
+            }
+
+            switch (edit.type) {
+            case "attrChange":
+            case "attrAdd":
+                targetElement.setAttribute(edit.attribute, self._parseEntities(edit.value));
+                break;
+            case "attrDelete":
+                targetElement.removeAttribute(edit.attribute);
+                break;
+            case "elementDelete":
+                if (targetElement.remove) {
+                    targetElement.remove();
+                } else if (targetElement.parentNode && targetElement.parentNode.removeChild) {
+                    targetElement.parentNode.removeChild(targetElement);
+                }
+                break;
+            case "elementInsert":
+                childElement = null;
+                if (editIsSpecialTag) {
+                    // If we already have one of these elements (which we should), then
+                    // just copy the attributes and set the ID.
+                    childElement = self.htmlDocument[edit.tag === "html" ? "documentElement" : edit.tag];
+                    if (!childElement) {
+                        // Treat this as a normal insertion.
+                        editIsSpecialTag = false;
+                    }
+                }
+                if (!editIsSpecialTag) {
+                    childElement = self.htmlDocument.createElement(edit.tag);
+                }
+
+                Object.keys(edit.attributes).forEach(function (attr) {
+                    childElement.setAttribute(attr, self._parseEntities(edit.attributes[attr]));
+                });
+                childElement.setAttribute("data-brackets-id", edit.tagID);
+
+                if (!editIsSpecialTag) {
+                    self._insertChildNode(targetElement, childElement, edit);
+                }
+                break;
+            case "elementMove":
+                childElement = self._queryBracketsID(edit.tagID);
+                self._insertChildNode(targetElement, childElement, edit);
+                break;
+            case "textInsert":
+                var textElement = self.htmlDocument.createTextNode(_isRawTextNode(targetElement) ? edit.content : self._parseEntities(edit.content));
+                self._insertChildNode(targetElement, textElement, edit);
+                break;
+            case "textReplace":
+            case "textDelete":
+                self._textReplace(targetElement, edit);
+                break;
+            }
+        });
+
+        this.rememberedNodes = {};
+
+        // update highlight after applying diffs
+        redrawHighlights();
+    };
+
+    function applyDOMEdits(edits) {
+        _editHandler.apply(edits);
+    }
+
+    /**
+     *
+     * @param {Element} elem
+     */
+    function _domElementToJSON(elem) {
+        var json = { tag: elem.tagName.toLowerCase(), attributes: {}, children: [] },
+            i,
+            len,
+            node,
+            value;
+
+        len = elem.attributes.length;
+        for (i = 0; i < len; i++) {
+            node = elem.attributes.item(i);
+            value = (node.name === "data-brackets-id") ? parseInt(node.value, 10) : node.value;
+            json.attributes[node.name] = value;
+        }
+
+        len = elem.childNodes.length;
+        for (i = 0; i < len; i++) {
+            node = elem.childNodes.item(i);
+
+            // ignores comment nodes and visuals generated by live preview
+            if (node.nodeType === Node.ELEMENT_NODE && node.className !== HIGHLIGHT_CLASSNAME) {
+                json.children.push(_domElementToJSON(node));
+            } else if (node.nodeType === Node.TEXT_NODE) {
+                json.children.push({ content: node.nodeValue });
+            }
+        }
+
+        return json;
+    }
+
+    function getSimpleDOM() {
+        return JSON.stringify(_domElementToJSON(window.document.documentElement));
+    }
+
+    // init
+    _editHandler = new DOMEditHandler(window.document);
+
+    if (experimental) {
+        window.document.addEventListener("keydown", onKeyDown);
+    }
+
+    return {
+        "DOMEditHandler"        : DOMEditHandler,
+        "keepAlive"             : keepAlive,
+        "showGoto"              : showGoto,
+        "hideHighlight"         : hideHighlight,
+        "highlight"             : highlight,
+        "highlightRule"         : highlightRule,
+        "redrawHighlights"      : redrawHighlights,
+        "applyDOMEdits"         : applyDOMEdits,
+        "getSimpleDOM"          : getSimpleDOM
+    };
+}
+())</script>
+
+
+    
+    <meta data-brackets-id="4" http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta data-brackets-id="5" name="viewport" content="width=device-width, initial-scale=1">
+    <meta data-brackets-id="6" name="description" content="">
+    <meta data-brackets-id="7" name="author" content="">
+
+    <title data-brackets-id="8">Panda</title>
+
+    <!-- Bootstrap Core CSS -->
+    <link data-brackets-id="9" href="./Panda_files/bootstrap.min.css" rel="stylesheet">
+
+    <!-- Custom Fonts -->
+    <link data-brackets-id="10" href="./Panda_files/font-awesome.min.css" rel="stylesheet" type="text/css">
+    <link data-brackets-id="11" href="./Panda_files/css" rel="stylesheet" type="text/css">
+    <link data-brackets-id="12" href="./Panda_files/css(1)" rel="stylesheet" type="text/css">
+    <link data-brackets-id="13" href="./Panda_files/css(2)" rel="stylesheet" type="text/css">
+    <link data-brackets-id="14" href="./Panda_files/css(3)" rel="stylesheet" type="text/css">
+    <link data-brackets-id="15" href="./Panda_files/css(4)" rel="stylesheet">
+
+    
+
+    <!-- Theme CSS -->
+    <link data-brackets-id="16" href="./Panda_files/agency.css" rel="stylesheet">
+
+    <!-- HTML5 Shim and Respond.js IE8 support of HTML5 elements and media queries -->
+    <!-- WARNING: Respond.js doesn't work if you view the page via file:// -->
+    <!--[if lt IE 9]>
+        <script src="https://oss.maxcdn.com/libs/html5shiv/3.7.0/html5shiv.js" integrity="sha384-0s5Pv64cNZJieYFkXYOTId2HMA2Lfb6q2nAcx2n0RTLUnCAoTTsS0nKEO27XyKcY" crossorigin="anonymous"></script>
+        <script src="https://oss.maxcdn.com/libs/respond.js/1.4.2/respond.min.js" integrity="sha384-ZoaMbDF+4LeFxg6WdScQ9nnR1QC2MIRxA1O9KWEXQwns1G8UNyIEZIQidzb0T1fo" crossorigin="anonymous"></script>
+    <![endif]-->
+    
+    <style data-brackets-id="17">
+        div1{
+            word-wrap: normal;
+            overflow-wrap: break-word;
+        }
+    </style>
+    
+</head>
+
+
+     
+     
+<body data-brackets-id="18" id="page-top" class="index">
+
+    <!-- Barra de Navegación -->
+    <nav data-brackets-id="19" id="mainNav" class="navbar navbar-default navbar-custom navbar-fixed-top affix">
+        <div data-brackets-id="20" class="container">
+            <div data-brackets-id="21" class="navbar-header page-scroll">
+                <button data-brackets-id="22" type="button" class="navbar-toggle" data-toggle="collapse" data-target="#bs-example-navbar-collapse-1">
+                    <span data-brackets-id="23" class="sr-only">Navegar</span>Menu <i data-brackets-id="24" class="fa fa-bicycle"></i>
+                </button>
+                <!--<a class="navbar-brand page-scroll" href="#page-top">Panda</a>-->
+                <a data-brackets-id="25" href="http://127.0.0.1:59368/index.html#page-top" class="page-scroll" alt="">
+                    <img data-brackets-id="26" class="logo logo-dark" alt="Logo" src="./Panda_files/logo_panda_opt4.png">
+                </a>
+
+            </div>
+
+            <!-- Collect the nav links, forms, and other content for toggling -->
+            <div data-brackets-id="27" class="collapse navbar-collapse" id="bs-example-navbar-collapse-1">
+                <ul data-brackets-id="28" class="nav navbar-nav navbar-right">
+                    <li data-brackets-id="29" class="hidden">
+                        <a data-brackets-id="30" href="http://127.0.0.1:59368/index.html#page-top"></a>
+                    </li>
+                    <li data-brackets-id="31" class="">
+                        <a data-brackets-id="32" class="page-scroll" href="http://127.0.0.1:59368/index.html#problema">¿Qué problemas resolvemos?</a>
+                    </li>
+                    <li data-brackets-id="33" class="">
+                        <a data-brackets-id="34" class="page-scroll" href="http://127.0.0.1:59368/index.html#portfolio">¿Como funciona?</a>
+                    </li>
+                    <li data-brackets-id="35" class="">
+                        <a data-brackets-id="36" class="page-scroll" href="http://127.0.0.1:59368/index.html#contact">UNETE!</a>
+                    </li>
+                    <li data-brackets-id="37" class="">
+                        <a data-brackets-id="38" class="page-scroll" href="http://127.0.0.1:59368/index.html#servicios">Nuestros servicios</a>
+                    </li>
+                    <li data-brackets-id="39" class="">
+                        <a data-brackets-id="40" class="page-scroll" href="http://127.0.0.1:59368/index.html#equipo">El equipo Panda</a>
+                    </li>
+                    <li data-brackets-id="41" class="active">
+                        <a data-brackets-id="42" class="page-scroll" href="http://127.0.0.1:59368/index.html#about">Nuestra Historia</a>
+                    </li>
+                </ul>
+            </div>
+            <!-- /.navbar-collapse -->
+        </div>
+        <!-- /.container-fluid -->
+    </nav>
+
+    <!-- Header -->
+    <header data-brackets-id="43">
+        <div data-brackets-id="44" class="container">
+            <div data-brackets-id="45" class="intro-text">
+                <div1 data-brackets-id="46" class="intro-heading">UNETE A LA PRIMERA RED DE ESTACIONAMIENTOS DE BICICLETAS</div1>
+                <div data-brackets-id="47" class="intro-lead-in">¡Conectemos la ciudad!</div>
+                <a data-brackets-id="48" href="http://127.0.0.1:59368/index.html#problema" class="page-scroll btn btn-xl">CONOCENOS</a>
+            </div>
+        </div>
+    </header>
+   
+    <!--Problema-->
+    <section2 data-brackets-id="49" id="problema">
+        <section data-brackets-id="50">    
+        <h2 data-brackets-id="51" class="section-heading-esp">¿Que problemas resolvemos?</h2> 
+        </section>
+    <div data-brackets-id="52" class="content-section-a">
+        <div data-brackets-id="53" class="container">
+            <div data-brackets-id="54" class="row">
+                <div data-brackets-id="55" class="col-lg-5 col-sm-6">
+                    <hr data-brackets-id="56" class="section-heading-spacer">
+                    <div data-brackets-id="57" class="clearfix"></div>
+                    <h3 data-brackets-id="58" class="section-heading">Problema I:<br data-brackets-id="59">¿Y la bicicleta?</h3>
+                    <p data-brackets-id="60" class="lead">
+                    Hoy en día los medios de tranporte motorizados son los que dominan las alternativas de movilizacíon.<br data-brackets-id="61">
+                    Aun así, la cantidad de ciclistas ha ido en aumento con el correr de los años.<br data-brackets-id="62">
+                    Nuestro servicio facilita el uso de la bicicleta como medio de transporte.
+                    </p>
+                </div>
+                <div data-brackets-id="63" class="col-lg-5 col-lg-offset-2 col-sm-6">
+                    <img data-brackets-id="64" class="img-responsive img-rounded" src="./Panda_files/donde_1.jpg" alt="">
+                </div>
+            </div>
+
+        </div>
+        <!-- /.container -->
+
+    </div>
+    <!-- /.content-section-a -->
+
+    <div data-brackets-id="65" class="content-section-b">
+
+        <div data-brackets-id="66" class="container">
+
+            <div data-brackets-id="67" class="row">
+                <div data-brackets-id="68" class="col-lg-5 col-lg-offset-1 col-sm-push-6  col-sm-6">
+                    <hr data-brackets-id="69" class="section-heading-spacer">
+                    <div data-brackets-id="70" class="clearfix"></div>
+                    <h2 data-brackets-id="71" class="section-heading">Problema II:<br data-brackets-id="72">¿Dónde estaciono?</h2>
+                    <p data-brackets-id="73" class="lead">
+                        No siempre hay un estacionamiento cercano a los lugares que queremos ir.<br data-brackets-id="74">
+                        Con la red de estacionamientos de Panda, siempre habrá un estacionamiento cercano a tu destino.<br data-brackets-id="75"> 
+                        Así, ciclistas y servicios estaran siempre comunicados.</p>
+                </div>
+                <div data-brackets-id="76" class="col-lg-5 col-sm-pull-6  col-sm-6">
+                    <img data-brackets-id="77" class="img-responsive img-rounded" src="./Panda_files/confused_bikers.jpg" alt="">
+                </div>
+            </div>
+
+        </div>
+        <!-- /.container -->
+
+    </div>
+    <!-- /.content-section-b -->
+
+    <div data-brackets-id="78" class="content-section-a">
+
+        <div data-brackets-id="79" class="container">
+
+            <div data-brackets-id="80" class="row">
+                <div data-brackets-id="81" class="col-lg-5 col-sm-6">
+                    <hr data-brackets-id="82" class="section-heading-spacer">
+                    <div data-brackets-id="83" class="clearfix"></div>
+                    <h2 data-brackets-id="84" class="section-heading">Problema III:<br data-brackets-id="85">¿Es un lugar seguro?</h2>
+                    <p data-brackets-id="86" class="lead">
+                    En la actualidad, las opciones para estacionar la bicicleta son principalmente <b data-brackets-id="87">estacionamientos de corta estadía</b>, como el de la foto.<br data-brackets-id="88">
+                    Estos estacionamientos necesitan estar ubicados en lugares de alto transito de peatones para disminuir la probabilidad de robos.<br data-brackets-id="89">
+                    Además, para ser utilizados necesitan dispositivos de seguridad como <b data-brackets-id="90">candados U-lock o cadenas,</b> los cuales no son siempre infalibles.<br data-brackets-id="91">
+                    Por medio de <b data-brackets-id="92">estacionamientos de larga estadía</b> le entregaremos a los ciclistas la tranquilidad de dejar la bicicletas en un lugar seguro y confiable.</p>
+                </div>
+                <div data-brackets-id="93" class="col-lg-5 col-lg-offset-2 col-sm-6">
+                    <img data-brackets-id="94" class="img-responsive img-rounded" src="./Panda_files/corta_estadia_1.jpg" alt="">
+                </div>
+            </div>
+
+        </div>
+        <!-- /.container -->
+
+    </div>
+    <!-- /.content-section-a -->
+    </section2>
+   
+    <!-- Como funciona -->
+    <section data-brackets-id="95" id="portfolio" class="bg-light-gray">
+        <div data-brackets-id="96" class="container">
+            <div data-brackets-id="97" class="row">
+                <div data-brackets-id="98" class="col-lg-12 text-center">
+                    <h2 data-brackets-id="99" class="section-heading">¿Como funciona?</h2>
+                    <h3 data-brackets-id="100" class="section-subheading text-muted">Si quieres usar tu bicicleta como medio de transporte, o trabajas en un negocio con atención a publico.<br data-brackets-id="101">
+                    ¡Tenemos una propuesta para ti!</h3>
+                </div>
+            </div>
+            <div data-brackets-id="102" class="row">
+                <div data-brackets-id="103" class="col-md-6 col-sm-6 col-lg-6 portfolio-item">
+                    <a data-brackets-id="104" href="http://127.0.0.1:59368/index.html#portfolioModal1" class="portfolio-link" data-toggle="modal">
+                        <div data-brackets-id="105" class="portfolio-hover">
+                            <div data-brackets-id="106" class="portfolio-hover-content">
+                                <i data-brackets-id="107" class="fa fa-bicycle fa-3x"></i>
+                            </div>
+                        </div>
+                        <img data-brackets-id="108" src="./Panda_files/ciclista.jpg" class="img-responsive" alt="">
+                    </a>
+                    <div data-brackets-id="109" class="portfolio-caption">
+                        <h4 data-brackets-id="110">¿Quieres usar tu bicicleta como medio de transporte?</h4>
+                        <p data-brackets-id="111" class="text-muted">Dinos donde te gustaria llegar en bicicleta.</p>
+                    </div>
+                </div>
+                <div data-brackets-id="112" class="col-md-6 col-sm-6 col-lg-6 portfolio-item">
+                    <a data-brackets-id="113" href="http://127.0.0.1:59368/index.html#portfolioModal2" class="portfolio-link" data-toggle="modal">
+                        <div data-brackets-id="114" class="portfolio-hover">
+                            <div data-brackets-id="115" class="portfolio-hover-content">
+                                <i data-brackets-id="116" class="fa fa-shopping-basket fa-3x"></i>
+                            </div>
+                        </div>
+                        <img data-brackets-id="117" src="./Panda_files/almacen_1.jpg" class="img-responsive" alt="">
+                    </a>
+                    <div data-brackets-id="118" class="portfolio-caption">
+                        <h4 data-brackets-id="119">¿Trabajas en un negocio con atención a publico?</h4>
+                        <p data-brackets-id="120" class="text-muted">Intégrate a nuestra red para aumentar tu publico y tus ventas.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+    
+    
+    
+    <!-- Servicios -->
+    <section data-brackets-id="121" id="servicios">
+        <div data-brackets-id="122" class="container">
+            <div data-brackets-id="123" class="row">
+                <div data-brackets-id="124" class="col-lg-12 text-center">
+                    <h2 data-brackets-id="125" class="section-heading">Nuestros servicios</h2>
+                    <h3 data-brackets-id="126" class="section-subheading text-muted">En Panda sabemos la libertad que te da andar en bicicleta, pero tambien sabemos que hoy en dia no es facil utilizarla para todo lo que te gustaria.<br data-brackets-id="127">Es por eso que hemos decidido cambiar la forma en que se hacen las cosas, entregandote una forma facil de ir donde quieras.
+					</h3>
+                </div>
+            </div>
+            <div data-brackets-id="128" class="row text-center">
+                <div data-brackets-id="129" class="col-md-4">
+                    <span data-brackets-id="130" class="fa-stack fa-4x">
+                        <i data-brackets-id="131" class="fa fa-circle fa-stack-2x text-primary"></i>
+                        <i data-brackets-id="132" class="fa2 fa-location-arrow fa-stack-1x fa-inverse"></i>
+                    </span>
+                    <h4 data-brackets-id="133" class="service-heading">Dinos donde quieres ir</h4>
+                    <p data-brackets-id="134" class="text-muted">Queremos saber donde irias en tu bicicleta.</p>
+                </div>
+                <div data-brackets-id="135" class="col-md-4">
+                    <span data-brackets-id="136" class="fa-stack fa-4x">
+                        <i data-brackets-id="137" class="fa fa-circle fa-stack-2x text-primary"></i>
+                        <i data-brackets-id="138" class="fa2 fa-mobile fa-stack-1x fa-inverse"></i>
+                    </span>
+                    <h4 data-brackets-id="139" class="service-heading">Información cuando la necesitas.</h4>
+                    <p data-brackets-id="140" class="text-muted">Queremos que tengas toda la información que necesitas al iniciar tu viaje, por lo que siempre tendras la seguridad de que llegaras a un estacionamiento con espacio disponible.<br data-brackets-id="141"> Monitoreamos en tiempo real la disponibilidad de plazas de estacionamiento en cada una de nuestras estaciones.</p>
+                </div>
+                <div data-brackets-id="142" class="col-md-4">
+                    <span data-brackets-id="143" class="fa-stack fa-4x">
+                        <i data-brackets-id="144" class="fa fa-circle fa-stack-2x text-primary"></i>
+                        <i data-brackets-id="145" class="fa2 fa-lock fa-stack-1x fa-inverse"></i>
+                    </span>
+                    <h4 data-brackets-id="146" class="service-heading">Sin candados, sin preocupaciones.</h4>
+                    <p data-brackets-id="147" class="text-muted">Con nuestros estacionemientos, no sera necesario que portes artefactos aparatosos para estacionar de una manera segura.Solo tu, tu bicicleta y tus ganas de pedalear.</p>
+                </div>
+            </div>
+            <div data-brackets-id="148" class="row text-center">
+                <div data-brackets-id="149" class="col-md-4">
+                    <span data-brackets-id="150" class="fa-stack fa-4x">
+                        <i data-brackets-id="151" class="fa fa-circle fa-stack-2x text-primary"></i>
+                        <i data-brackets-id="152" class="fa2 fa-bicycle fa-stack-1x fa-inverse"></i>
+                    </span>
+                    <h4 data-brackets-id="153" class="service-heading">Estacionamientos en tus servicios favoritos</h4>
+                    <p data-brackets-id="154" class="text-muted">Cerca de tu trabajo, de tu universidad, del mall o del metro. Queremos estar en todos lados, queremos que llegues donde quieras.</p>
+                </div>
+                <div data-brackets-id="155" class="col-md-4">
+                    <span data-brackets-id="156" class="fa-stack fa-4x">
+                        <i data-brackets-id="157" class="fa fa-circle fa-stack-2x text-primary"></i>
+                        <i data-brackets-id="158" class="fa2 fa-laptop fa-stack-1x fa-inverse"></i>
+                    </span>
+                    <h4 data-brackets-id="159" class="service-heading">Servicios adicionales</h4>
+                    <p data-brackets-id="160" class="text-muted">En Panda conocemos el proceso de uso de la bicicleta, por lo que en algunas ocasiones, el estacionamiento por si no basta. Es por eso que queremos que nuestros estacionamientos tengan servicios adicionales, tu dinos lo que quieres y nosotros te lo damos!</p>
+                </div>
+                <div data-brackets-id="161" class="col-md-4">
+                    <span data-brackets-id="162" class="fa-stack fa-4x">
+                        <i data-brackets-id="163" class="fa fa-circle fa-stack-2x text-primary"></i>
+                        <i data-brackets-id="164" class="fa2 fa-lock fa-stack-1x fa-inverse"></i>
+                    </span>
+                    <h4 data-brackets-id="165" class="service-heading">Cooperativo</h4>
+                    <p data-brackets-id="166" class="text-muted">Queremos estar alli donde tu quieras ir, pero para eso necesitamos saber donde es que quieres ir. Queremos escucharte, tu opinion no solo nos importa, es vital para saber que es lo que los ciclistas necesitan.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Team Section -->
+    <section data-brackets-id="167" id="equipo" class="bg-light-gray">
+        <div data-brackets-id="168" class="container">
+            <div data-brackets-id="169" class="row">
+                <div data-brackets-id="170" class="col-lg-12 text-center">
+                    <h2 data-brackets-id="171" class="section-heading">El equipo Panda</h2>
+                    <h3 data-brackets-id="172" class="section-subheading text-muted">Somos un equipo con perfiles distintos, pero con un objetivo comun:<br data-brackets-id="173"> Devolver a la bicicleta al lugar que jamas debio abandonar entre de los medios de movilización.</h3>
+                </div>
+            </div>
+            <div data-brackets-id="174" class="row">
+                <div data-brackets-id="175" class="col-sm-4">
+                    <div data-brackets-id="176" class="team-member">
+                        <img data-brackets-id="177" src="./Panda_files/matias.png" class="img-responsive img-circle" alt="">
+                        <h4 data-brackets-id="178">Matías Barrios</h4>
+                        <p data-brackets-id="179" class="text-muted">CTO &amp; Co-Founder</p>
+                        <ul data-brackets-id="180" class="list-inline social-buttons">
+                            <li data-brackets-id="181"><a data-brackets-id="182" href="http://127.0.0.1:59368/index.html#"><i data-brackets-id="183" class="fa fa-twitter"></i></a>
+                            </li>
+                            <li data-brackets-id="184"><a data-brackets-id="185" href="http://127.0.0.1:59368/index.html#"><i data-brackets-id="186" class="fa fa-facebook"></i></a>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+                <div data-brackets-id="187" class="col-sm-4">
+                    <div data-brackets-id="188" class="team-member">
+                        <img data-brackets-id="189" src="./Panda_files/richard.png" class="img-responsive img-circle" alt="">
+                        <h4 data-brackets-id="190">Richard Jerez</h4>
+                        <p data-brackets-id="191" class="text-muted">CEO &amp; Co-Founder</p>
+                        <ul data-brackets-id="192" class="list-inline social-buttons">
+                            <li data-brackets-id="193"><a data-brackets-id="194" href="http://127.0.0.1:59368/index.html#"><i data-brackets-id="195" class="fa fa-twitter"></i></a>
+                            </li>
+                            <li data-brackets-id="196"><a data-brackets-id="197" href="http://127.0.0.1:59368/index.html#"><i data-brackets-id="198" class="fa fa-facebook"></i></a>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+                <div data-brackets-id="199" class="col-sm-4">
+                    <div data-brackets-id="200" class="team-member">
+                        <img data-brackets-id="201" src="./Panda_files/gise_opt.jpg" class="img-responsive img-circle" alt="">
+                        <h4 data-brackets-id="202">Gisella Nuñez</h4>
+                        <p data-brackets-id="203" class="text-muted">CMO &amp; Co-Founder</p>
+                        <ul data-brackets-id="204" class="list-inline social-buttons">
+                            <li data-brackets-id="205"><a data-brackets-id="206" href="http://127.0.0.1:59368/index.html#"><i data-brackets-id="207" class="fa fa-twitter"></i></a>
+                            </li>
+                            <li data-brackets-id="208"><a data-brackets-id="209" href="http://127.0.0.1:59368/index.html#"><i data-brackets-id="210" class="fa fa-facebook"></i></a>
+                            </li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+            <div data-brackets-id="211" class="row">
+                <div data-brackets-id="212" class="col-lg-8 col-lg-offset-2 text-center">
+                    <p data-brackets-id="213" class="large text-muted">Lorem ipsum dolor sit amet, consectetur adipisicing elit. Aut eaque, laboriosam veritatis, quos non quis ad perspiciatis, totam corporis ea, alias ut unde.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- About Section -->
+    <section data-brackets-id="214" id="about">
+        <div data-brackets-id="215" class="container">
+            <div data-brackets-id="216" class="row">
+                <div data-brackets-id="217" class="col-lg-12 text-center">
+                    <h2 data-brackets-id="218" class="section-heading">Nuestro camino hasta la idea</h2>
+                    <h3 data-brackets-id="219" class="section-subheading text-muted">Panda tiene como mision mostrar a la sociedad que existe un mejor modo de vivir.<br data-brackets-id="220">Nuestra historia es la de personas convencidas de que siempre hay una mejor forma de hacer las cosas.<br data-brackets-id="221">Desde el dia 0 que nuestros pasos han sido distintos a lo comun. </h3>
+                </div>
+            </div>
+            <div data-brackets-id="222" class="row">
+                <div data-brackets-id="223" class="col-lg-12">
+                    <ul data-brackets-id="224" class="timeline">
+                        <li data-brackets-id="225">
+                            <div data-brackets-id="226" class="timeline-image">
+                                <img data-brackets-id="227" class="img-circle img-responsive" src="./Panda_files/1.jpg" alt="">
+                            </div>
+                            <div data-brackets-id="228" class="timeline-panel">
+                                <div data-brackets-id="229" class="timeline-heading">
+                                    <h4 data-brackets-id="230">Agosto 2016</h4>
+                                    <h4 data-brackets-id="231" class="subheading">Nace un equipo.</h4>
+                                </div>
+                                <div data-brackets-id="232" class="timeline-body">
+                                    <p data-brackets-id="233" class="text-muted">Nos conocimos en la universidad , siendo los tres memoristas. Participamos de un programa de memorias llamado Memorias Multidisciplinarias. En este programa , diversas entidades privadas vienen a postular desafios para que los memoristas se animen a solucionarlos.<br data-brackets-id="234">Nuestro caso fue distinto. Richard propuso a la bicicleta como protagonista de la movilización, y formamos nuestro equipo.</p>
+                                </div>
+                            </div>
+                        </li>
+                        <li data-brackets-id="235" class="timeline-inverted">
+                            <div data-brackets-id="236" class="timeline-image">
+                                <img data-brackets-id="237" class="img-circle img-responsive" src="./Panda_files/2.jpg" alt="">
+                            </div>
+                            <div data-brackets-id="238" class="timeline-panel">
+                                <div data-brackets-id="239" class="timeline-heading">
+                                    <h4 data-brackets-id="240">Septiembre 2016</h4>
+                                    <h4 data-brackets-id="241" class="subheading">Primera presentación tecnica.</h4>
+                                </div>
+                                <div data-brackets-id="242" class="timeline-body">
+                                    <p data-brackets-id="243" class="text-muted">Dentro del mismo programa, uno de los mayores desafios a los que nos encontramos era el donde partir. Dentro de nuestras ganas de querer cambiar las cosas, encontramos un millon de soluciones distintas para el mismo problema.Nada estaba claro, sobre todo por las confusiones que se presentan cuando las ideas fluyen con naturalidad como en nuestro equipo.Propusimos un sistema de bicicletas publicos, nada mas lejos , por ahora , de solucionarle la vida a los ciclistas. </p>
+                                </div>
+                            </div>
+                        </li>
+                        <li data-brackets-id="244">
+                            <div data-brackets-id="245" class="timeline-image">
+                                <img data-brackets-id="246" class="img-circle img-responsive" src="./Panda_files/3.jpg" alt="">
+                            </div>
+                            <div data-brackets-id="247" class="timeline-panel">
+                                <div data-brackets-id="248" class="timeline-heading">
+                                    <h4 data-brackets-id="249">Octubre 2016</h4>
+                                    <h4 data-brackets-id="250" class="subheading">Re-ingenieria</h4>
+                                </div>
+                                <div data-brackets-id="251" class="timeline-body">
+                                    <p data-brackets-id="252" class="text-muted">Si bien el donde estacionar es uno de los tantos obstaculos a los que se enfrentan los ciclistas, nosotros quisimos ir por todo. El que mucho abarca , poco aprieta.<br data-brackets-id="253"> Debimos volver a los origenes , estudiar el problema, entender el estado del arte para aclarar nuestras ideas.</p>
+                                </div>
+                            </div>
+                        </li>
+                        <li data-brackets-id="254" class="timeline-inverted">
+                            <div data-brackets-id="255" class="timeline-image">
+                                <img data-brackets-id="256" class="img-circle img-responsive" src="./Panda_files/4.jpg" alt="">
+                            </div>
+                            <div data-brackets-id="257" class="timeline-panel">
+                                <div data-brackets-id="258" class="timeline-heading">
+                                    <h4 data-brackets-id="259">Noviembre 2016</h4>
+                                    <h4 data-brackets-id="260" class="subheading">Bingo!</h4>
+                                </div>
+                                <div data-brackets-id="261" class="timeline-body">
+                                    <p data-brackets-id="262" class="text-muted">Como equipo, acostumbrabamos a pasar tardes enteras discutiendo acerca de variables de nuestro proyecto. Posiblemente esa emoción fue la que nos alejo de nuestro objetivo; devolverle la libertad a los ciclistas. Despues de mucho discutir, ocurrio que </p>
+                                </div>
+                            </div>
+                        </li>
+                        <li data-brackets-id="263" class="timeline-inverted">
+                            <div data-brackets-id="264" class="timeline-image">
+                                <h4 data-brackets-id="265">Se parte
+                                    <br data-brackets-id="266">de nuestra historia
+								</h4>
+                            </div>
+                        </li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Clients Aside -->
+<!--
+    
+    <aside class="clients">
+        <div class="container">
+            <div class="row">
+                <div class="col-md-3 col-sm-6">
+                    <a href="#">
+                        <img src="img/logos/envato.jpg" class="img-responsive img-centered" alt="">
+                    </a>
+                </div>
+                <div class="col-md-3 col-sm-6">
+                    <a href="#">
+                        <img src="img/logos/designmodo.jpg" class="img-responsive img-centered" alt="">
+                    </a>
+                </div>
+                <div class="col-md-3 col-sm-6">
+                    <a href="#">
+                        <img src="img/logos/themeforest.jpg" class="img-responsive img-centered" alt="">
+                    </a>
+                </div>
+                <div class="col-md-3 col-sm-6">
+                    <a href="#">
+                        <img src="img/logos/creative-market.jpg" class="img-responsive img-centered" alt="">
+                    </a>
+                </div>
+            </div>
+        </div>
+    </aside>
+-->
+
+ 
+    <footer data-brackets-id="267">
+        <div data-brackets-id="268" class="container">
+            <div data-brackets-id="269" class="row">
+                <div data-brackets-id="270" class="col-md-4">
+                    <span data-brackets-id="271" class="copyright">Copyright © Your Website 2016</span>
+                </div>
+                <div data-brackets-id="272" class="col-md-4">
+                    <ul data-brackets-id="273" class="list-inline social-buttons">
+                        <li data-brackets-id="274"><a data-brackets-id="275" href="http://127.0.0.1:59368/index.html#"><i data-brackets-id="276" class="fa fa-twitter"></i></a>
+                        </li>
+                        <li data-brackets-id="277"><a data-brackets-id="278" href="http://127.0.0.1:59368/index.html#"><i data-brackets-id="279" class="fa fa-facebook"></i></a>
+                        </li>
+                        <li data-brackets-id="280"><a data-brackets-id="281" href="http://127.0.0.1:59368/index.html#"><i data-brackets-id="282" class="fa fa-linkedin"></i></a>
+                        </li>
+                    </ul>
+                </div>
+                <div data-brackets-id="283" class="col-md-4">
+                    <ul data-brackets-id="284" class="list-inline quicklinks">
+                        <li data-brackets-id="285"><a data-brackets-id="286" href="http://127.0.0.1:59368/index.html#">Privacy Policy</a>
+                        </li>
+                        <li data-brackets-id="287"><a data-brackets-id="288" href="http://127.0.0.1:59368/index.html#">Terms of Use</a>
+                        </li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <!-- Portfolio Modals -->
+    <!-- Use the modals below to showcase details about your portfolio projects! -->
+
+    <!-- Portfolio Modal 1 -->
+    <div data-brackets-id="289" class="portfolio-modal modal fade" id="portfolioModal1" tabindex="-1" role="dialog" aria-hidden="true">
+        <div data-brackets-id="290" class="modal-dialog">
+            <div data-brackets-id="291" class="modal-content">
+                <div data-brackets-id="292" class="close-modal" data-dismiss="modal">
+                    <div data-brackets-id="293" class="lr">
+                        <div data-brackets-id="294" class="rl">
+                        </div>
+                    </div>
+                </div>
+                <div data-brackets-id="295" class="container">
+                    <div data-brackets-id="296" class="row">
+                        <div data-brackets-id="297" class="col-lg-8 col-lg-offset-2">
+                            <div data-brackets-id="298" class="modal-body">
+                                <!-- Project Details Go Here -->
+                                <h2 data-brackets-id="299">dinos donde quieres ir en tu bicicleta.</h2>
+                                <p data-brackets-id="300" class="item-intro text-muted">Queremos estar donde tu vayas.</p>
+                                <img data-brackets-id="301" class="img-responsive img-centered" src="./Panda_files/mapfolding.gif" alt="">
+                                <p data-brackets-id="302">Conocemos lo incomodo que es dejar tu bicicleta estacionada en un lugar que no te entrega confianza.<br data-brackets-id="303">
+                                Al final de la pagina o <a data-brackets-id="304" href="http://127.0.0.1:59368/index.html#contact">haciendo click aqui</a> accederas a un formulario en el cual queremos que nos digas donde quieres llegar en tu bicicleta.<br data-brackets-id="305">
+                                Completa el formulario y podremos estar en contacto contigo.<br data-brackets-id="306"> 
+                                Te informaremos acerca de novedades y tendras noticias de los estacionamientos que iremos habilitando.<br data-brackets-id="307">
+                                <b data-brackets-id="308">¡Tu ayuda es fundamental!</b>, ya que con la información que nos entregas sabremos donde abrir nuevos puntos de estacionamiento.<br data-brackets-id="309">
+                                ¡Unete a nuestra comunidad y vive úna experiencia unica de movilidad!<br data-brackets-id="310">
+                                </p>
+                                <button data-brackets-id="311" type="button" class="btn btn-primary" data-dismiss="modal"><i data-brackets-id="312" class="fa fa-times"></i> Cerrar</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Portfolio Modal 2 -->
+    <div data-brackets-id="313" class="portfolio-modal modal fade" id="portfolioModal2" tabindex="-1" role="dialog" aria-hidden="true">
+        <div data-brackets-id="314" class="modal-dialog">
+            <div data-brackets-id="315" class="modal-content">
+                <div data-brackets-id="316" class="close-modal" data-dismiss="modal">
+                    <div data-brackets-id="317" class="lr">
+                        <div data-brackets-id="318" class="rl">
+                        </div>
+                    </div>
+                </div>
+                <div data-brackets-id="319" class="container">
+                    <div data-brackets-id="320" class="row">
+                        <div data-brackets-id="321" class="col-lg-8 col-lg-offset-2">
+                            <div data-brackets-id="322" class="modal-body">
+                                <h2 data-brackets-id="323">Integra a tus servicios un estacionamiento de larga estadía.</h2>
+                                <p data-brackets-id="324" class="item-intro text-muted">Aumenta la cantidad de visitas de tu local.</p>
+                                <img data-brackets-id="325" class="img-responsive img-centered" src="./Panda_files/biciestacionamiento_1.jpg" alt="">
+                                <p data-brackets-id="326">
+                                ¿Te gustaría llevar clientes directamente a la puerta de tu local?.<br data-brackets-id="327">
+                                Te ofrecemos la oportunidad de integrar a tus servicios un estacionamiento de larga estadía como el de la foto.<br data-brackets-id="328">
+                                Llena el formulario que esta al final de la pagina o <a data-brackets-id="329" href="http://127.0.0.1:59368/index.html#contact">haz click aqui</a> e indicanos donde está ubicado tu local y que servicios ofreces.<br data-brackets-id="330">
+                                Te visitaremos e instalaremos todo lo necesario para que te unas a nuestra comunidad.<br data-brackets-id="331"> 
+                                Además, te entregaremos información acerca de las visitas que has tenido, para que puedas tomar decisiones estratégicas y así incrementar tus ventas.<br data-brackets-id="332">
+                                ¡Aumenta la cantidad visitas a tu local y mejora tus ingresos!</p>
+                                <button data-brackets-id="333" type="button" class="btn btn-primary" data-dismiss="modal"><i data-brackets-id="334" class="fa fa-times"></i> Cerrar</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Portfolio Modal 3 -->
+    <div data-brackets-id="335" class="portfolio-modal modal fade" id="portfolioModal3" tabindex="-1" role="dialog" aria-hidden="true">
+        <div data-brackets-id="336" class="modal-dialog">
+            <div data-brackets-id="337" class="modal-content">
+                <div data-brackets-id="338" class="close-modal" data-dismiss="modal">
+                    <div data-brackets-id="339" class="lr">
+                        <div data-brackets-id="340" class="rl">
+                        </div>
+                    </div>
+                </div>
+                <div data-brackets-id="341" class="container">
+                    <div data-brackets-id="342" class="row">
+                        <div data-brackets-id="343" class="col-lg-8 col-lg-offset-2">
+                            <div data-brackets-id="344" class="modal-body">
+                                <!-- Project Details Go Here -->
+                                <h2 data-brackets-id="345">Project Name</h2>
+                                <p data-brackets-id="346" class="item-intro text-muted">Lorem ipsum dolor sit amet consectetur.</p>
+                                <img data-brackets-id="347" class="img-responsive img-centered" src="./Panda_files/treehouse-preview.png" alt="">
+                                <p data-brackets-id="348">Treehouse is a free PSD web template built by <a data-brackets-id="349" href="https://www.behance.net/MathavanJaya">Mathavan Jaya</a>. This is bright and spacious design perfect for people or startup companies looking to showcase their apps or other projects.</p>
+                                <p data-brackets-id="350">You can download the PSD template in this portfolio sample item at <a data-brackets-id="351" href="http://freebiesxpress.com/gallery/treehouse-free-psd-web-template/">FreebiesXpress.com</a>.</p>
+                                <button data-brackets-id="352" type="button" class="btn btn-primary" data-dismiss="modal"><i data-brackets-id="353" class="fa fa-times"></i> Close Project</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Portfolio Modal 4 -->
+    <div data-brackets-id="354" class="portfolio-modal modal fade" id="portfolioModal4" tabindex="-1" role="dialog" aria-hidden="true">
+        <div data-brackets-id="355" class="modal-dialog">
+            <div data-brackets-id="356" class="modal-content">
+                <div data-brackets-id="357" class="close-modal" data-dismiss="modal">
+                    <div data-brackets-id="358" class="lr">
+                        <div data-brackets-id="359" class="rl">
+                        </div>
+                    </div>
+                </div>
+                <div data-brackets-id="360" class="container">
+                    <div data-brackets-id="361" class="row">
+                        <div data-brackets-id="362" class="col-lg-8 col-lg-offset-2">
+                            <div data-brackets-id="363" class="modal-body">
+                                <!-- Project Details Go Here -->
+                                <h2 data-brackets-id="364">Project Name</h2>
+                                <p data-brackets-id="365" class="item-intro text-muted">Lorem ipsum dolor sit amet consectetur.</p>
+                                <img data-brackets-id="366" class="img-responsive img-centered" src="./Panda_files/golden-preview.png" alt="">
+                                <p data-brackets-id="367">Start Bootstrap's Agency theme is based on Golden, a free PSD website template built by <a data-brackets-id="368" href="https://www.behance.net/MathavanJaya">Mathavan Jaya</a>. Golden is a modern and clean one page web template that was made exclusively for Best PSD Freebies. This template has a great portfolio, timeline, and meet your team sections that can be easily modified to fit your needs.</p>
+                                <p data-brackets-id="369">You can download the PSD template in this portfolio sample item at <a data-brackets-id="370" href="http://freebiesxpress.com/gallery/golden-free-one-page-web-template/">FreebiesXpress.com</a>.</p>
+                                <button data-brackets-id="371" type="button" class="btn btn-primary" data-dismiss="modal"><i data-brackets-id="372" class="fa fa-times"></i> Close Project</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Portfolio Modal 5 -->
+    <div data-brackets-id="373" class="portfolio-modal modal fade" id="portfolioModal5" tabindex="-1" role="dialog" aria-hidden="true">
+        <div data-brackets-id="374" class="modal-dialog">
+            <div data-brackets-id="375" class="modal-content">
+                <div data-brackets-id="376" class="close-modal" data-dismiss="modal">
+                    <div data-brackets-id="377" class="lr">
+                        <div data-brackets-id="378" class="rl">
+                        </div>
+                    </div>
+                </div>
+                <div data-brackets-id="379" class="container">
+                    <div data-brackets-id="380" class="row">
+                        <div data-brackets-id="381" class="col-lg-8 col-lg-offset-2">
+                            <div data-brackets-id="382" class="modal-body">
+                                <!-- Project Details Go Here -->
+                                <h2 data-brackets-id="383">Project Name</h2>
+                                <p data-brackets-id="384" class="item-intro text-muted">Lorem ipsum dolor sit amet consectetur.</p>
+                                <img data-brackets-id="385" class="img-responsive img-centered" src="./Panda_files/escape-preview.png" alt="">
+                                <p data-brackets-id="386">Escape is a free PSD web template built by <a data-brackets-id="387" href="https://www.behance.net/MathavanJaya">Mathavan Jaya</a>. Escape is a one page web template that was designed with agencies in mind. This template is ideal for those looking for a simple one page solution to describe your business and offer your services.</p>
+                                <p data-brackets-id="388">You can download the PSD template in this portfolio sample item at <a data-brackets-id="389" href="http://freebiesxpress.com/gallery/escape-one-page-psd-web-template/">FreebiesXpress.com</a>.</p>
+                                <button data-brackets-id="390" type="button" class="btn btn-primary" data-dismiss="modal"><i data-brackets-id="391" class="fa fa-times"></i> Close Project</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Portfolio Modal 6 -->
+    <div data-brackets-id="392" class="portfolio-modal modal fade" id="portfolioModal6" tabindex="-1" role="dialog" aria-hidden="true">
+        <div data-brackets-id="393" class="modal-dialog">
+            <div data-brackets-id="394" class="modal-content">
+                <div data-brackets-id="395" class="close-modal" data-dismiss="modal">
+                    <div data-brackets-id="396" class="lr">
+                        <div data-brackets-id="397" class="rl">
+                        </div>
+                    </div>
+                </div>
+                <div data-brackets-id="398" class="container">
+                    <div data-brackets-id="399" class="row">
+                        <div data-brackets-id="400" class="col-lg-8 col-lg-offset-2">
+                            <div data-brackets-id="401" class="modal-body">
+                                <!-- Project Details Go Here -->
+                                <h2 data-brackets-id="402">Project Name</h2>
+                                <p data-brackets-id="403" class="item-intro text-muted">Lorem ipsum dolor sit amet consectetur.</p>
+                                <img data-brackets-id="404" class="img-responsive img-centered" src="./Panda_files/dreams-preview.png" alt="">
+                                <p data-brackets-id="405">Dreams is a free PSD web template built by <a data-brackets-id="406" href="https://www.behance.net/MathavanJaya">Mathavan Jaya</a>. Dreams is a modern one page web template designed for almost any purpose. It’s a beautiful template that’s designed with the Bootstrap framework in mind.</p>
+                                <p data-brackets-id="407">You can download the PSD template in this portfolio sample item at <a data-brackets-id="408" href="http://freebiesxpress.com/gallery/dreams-free-one-page-web-template/">FreebiesXpress.com</a>.</p>
+                                <button data-brackets-id="409" type="button" class="btn btn-primary" data-dismiss="modal"><i data-brackets-id="410" class="fa fa-times"></i> Close Project</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- jQuery -->
+    <script data-brackets-id="411" src="./Panda_files/jquery.min.js"></script>
+
+    <!-- Bootstrap Core JavaScript -->
+    <script data-brackets-id="412" src="./Panda_files/bootstrap.min.js"></script>
+
+    <!-- Plugin JavaScript -->
+    <script data-brackets-id="413" src="./Panda_files/jquery.easing.min.js" integrity="sha384-mE6eXfrb8jxl0rzJDBRanYqgBxtJ6Unn4/1F7q4xRRyIw7Vdg9jP4ycT7x1iVsgb" crossorigin="anonymous"></script>
+
+    <!-- Contact Form JavaScript -->
+    <script data-brackets-id="414" src="./Panda_files/jqBootstrapValidation.js"></script>
+    <script data-brackets-id="415" src="./Panda_files/contact_me.js"></script>
+
+    <!-- Theme JavaScript -->
+    <script data-brackets-id="416" src="./Panda_files/agency.min.js"></script>
+
+
+
+
+
+
+
+</body></html>
