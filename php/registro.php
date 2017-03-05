@@ -1,6 +1,6 @@
 <?php
 // Conectando, seleccionando la base de datos
-include '../conexion_php/cn.php';
+include 'cn.php';
 $nombre = $_POST["nombre"];
 $apellido = $_POST["apellido"];
 $rut = $_POST["rut"];
@@ -9,12 +9,6 @@ $telefono = $_POST["telefono"];
 $password = $_POST["password"];
 
 //Query registro
-//$register = "insert into usuarios values (16940663-4,'Matias','Barrios','asdasdasd','86698242','hola');";
-
-
-
-
-
 $verificar_usuario = mysqli_query($link, "SELECT * FROM usuarios WHERE rut = '$rut'");
 
 if(mysqli_num_rows($verificar_usuario)>0){

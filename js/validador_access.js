@@ -1,4 +1,4 @@
-function validador_registro() {
+function validador_access() {
     var nombre, apellido, rut, email, telefono, password, confirmpass,  expresion_correo, expresion_rut, expresion_telefono;
     nombre = document.getElementById("nombre").value;
     apellido = document.getElementById("apellido").value;
@@ -9,11 +9,11 @@ function validador_registro() {
     confirmpass = document.getElementById("confirmpass").value;
     
     expresion_email = /\w+@+\w+\.+[a-z]/;
-//    if (nombre === "" || apellido === "" || rut === "" || email === "" || telefono === "" || password === "" || confirmpass === "") {
-//        alert("Todos los campos son obligatorios");
-//        return false;
-//    }
-    if (nombre.length>45) {
+    if (nombre === "" || apellido === "" || rut === "" || email === "" || telefono === "" || password === "" || confirmpass === "") {
+        alert("Todos los campos son obligatorios");
+        return false;
+    }
+    else if (nombre.length>45) {
         alert("Nombre demasiado largo");
         return false;
     }
@@ -21,8 +21,8 @@ function validador_registro() {
         alert("El Rut ingresado no es válido, ingrese su rut sin puntos ni guión");
         return false;
     }
-    else if (rut.length>9){
-        alert("Rut demasiado largo");
+    else if (rut.length>9 || rut.length<8){
+        alert("Rut incorrecto");
         return false;
     }
     else if (!expresion_email.test(email)) {
