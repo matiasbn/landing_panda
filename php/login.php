@@ -1,13 +1,13 @@
 <?php
 // Conectando, seleccionando la base de datos
-include '../conexion_php/cn.php';
-$rut = $_POST["rut"];
-$password = $_POST["password"];
+include 'cn.php';
+$rut_login = $_POST["rut_login"];
+$password_login = $_POST["password_login"];
 
 //Query registro
 //$register = "insert into usuarios values (16940663-4,'Matias','Barrios','asdasdasd','86698242','hola');";
 
-$verificar_usuario = mysqli_query($link, "SELECT * FROM usuarios WHERE rut = '$rut'");
+$verificar_usuario = mysqli_query($link, "SELECT * FROM usuarios WHERE rut = '$rut_login'");
 
 if(mysqli_num_rows($verificar_usuario)==0){
     echo '<script>
@@ -16,17 +16,18 @@ if(mysqli_num_rows($verificar_usuario)==0){
         </script>';
 }
 else {
-    $login = "SELECT password FROM usuarios WHERE rut='$rut';";
     //Envío de query
-    $result = mysqli_query($link,$register);
-    if(!$result){
-        echo 'Error al registrarse';
+    $login = mysqli_query($link,"SELECT * FROM usuarios WHERE rut='$rut_login' AND password='$password_login'");
+    if(mysqli_num_rows($login)==0){
+        echo  '<script>
+                alert("Contraseña incorrecta");
+                window.history.go(-1);
+               </script>';
     }
-    else{
-        
+    else{   
     echo  '<script>
-            alert("¡Bienvenido!");
-            window.history.go(-1);
+            alert("¡Bienvenido de nuevo!");
+            window.location.assign("../user/index.html") ;
            </script>';
     }
 
