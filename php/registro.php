@@ -18,7 +18,7 @@ if(mysqli_num_rows($verificar_usuario)>0){
         </script>';
 }
 else {
-    $register = "INSERT INTO usuarios (nombre,apellido,rut,email,telefono,password) values ('$nombre','$apellido','$rut','$email','$telefono','$password');";
+    $register = "INSERT INTO usuarios (nombre,apellido,rut,email,telefono,password,fecha_inscripcion) values ('$nombre','$apellido','$rut','$email','$telefono','$password', CURRENT_TIMESTAMP());";
     //Envío de query
     $result = mysqli_query($link,$register);
     if(!$result){
@@ -26,8 +26,8 @@ else {
     }
     else{
     echo  '<script>
-            alert("¡Bienvenido!");
-            window.history.go(-1);
+            alert("¡Registrado!, ya puedes iniciar sesión");
+            window.location.assign("../access.html") ;
            </script>';
     }
 
